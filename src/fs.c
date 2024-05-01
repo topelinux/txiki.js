@@ -276,6 +276,7 @@ static void uv__fs_req_cb(uv_fs_t *req) {
     bool is_reject = false;
 
     if (req->result < 0) {
+        printf("fs type: %d\n", req->fs_type);
         arg = tjs_new_error(ctx, fr->req.result);
         is_reject = true;
         goto skip;
@@ -374,14 +375,11 @@ skip:
 
 static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
     TJSFile *f = tjs_file_get(ctx, this_val);
-    uv_fs_cb cb = uv__fs_req_cb;
-
+    int is_sync = magic & 0x2;
+    int is_write = magic & 0x1;
+    uv_fs_cb cb = is_sync ? NULL : uv__fs_req_cb;
     if (!f)
         return JS_EXCEPTION;
-
-    int is_sync = magic & 0x2;
-    magic = magic & 0x1;
-
     if (is_sync)
         cb = NULL;
 
@@ -403,8 +401,8 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
     uv_buf_t b = uv_buf_init((char *) buf, size);
 
     int r;
-    if (magic)
-        r = uv_fs_write(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, uv__fs_req_cb);
+    if (is_write)
+        r = uv_fs_write(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, cb);
     else
         r = uv_fs_read(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, cb);
 
