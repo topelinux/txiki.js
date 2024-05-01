@@ -374,8 +374,16 @@ skip:
 
 static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
     TJSFile *f = tjs_file_get(ctx, this_val);
+    uv_fs_cb cb = uv__fs_req_cb;
+
     if (!f)
         return JS_EXCEPTION;
+
+    int is_sync = magic & 0x2;
+    magic = magic & 0x1;
+
+    if (is_sync)
+        cb = NULL;
 
     /* arg 0: buffer */
     size_t size;
@@ -398,15 +406,19 @@ static JSValue tjs_file_rw(JSContext *ctx, JSValue this_val, int argc, JSValue *
     if (magic)
         r = uv_fs_write(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, uv__fs_req_cb);
     else
-        r = uv_fs_read(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, uv__fs_req_cb);
-    if (r != 0) {
-        js_free(ctx, fr);
-        return tjs_throw_errno(ctx, r);
-    }
+        r = uv_fs_read(tjs_get_loop(ctx), &fr->req, f->fd, &b, 1, pos, cb);
 
-    tjs_fsreq_init(ctx, fr, this_val);
-    fr->rw.tarray = JS_DupValue(ctx, argv[0]);
-    return fr->result.p;
+    if (!is_sync) {
+        if (r != 0) {
+            js_free(ctx, fr);
+            return tjs_throw_errno(ctx, r);
+        }
+        tjs_fsreq_init(ctx, fr, this_val);
+        fr->rw.tarray = JS_DupValue(ctx, argv[0]);
+        return fr->result.p;
+    } else {
+        return JS_NewInt32(ctx, r);
+    }
 }
 
 static JSValue tjs_file_close(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -735,12 +747,15 @@ static int js__uv_open_flags(const char *strflags, size_t len) {
     return flags;
 }
 
-static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
     const char *path;
     const char *strflags;
     size_t len;
     int flags;
     int32_t mode;
+    bool is_sync = magic == 1 ? true: false;
+    uv_fs_cb cb = is_sync ? NULL: uv__fs_req_cb;
+    JSValue a;
 
     path = JS_ToCString(ctx, argv[0]);
     if (!path)
@@ -766,7 +781,20 @@ static JSValue tjs_fs_open(JSContext *ctx, JSValue this_val, int argc, JSValue *
         return JS_EXCEPTION;
     }
 
-    int r = uv_fs_open(tjs_get_loop(ctx), &fr->req, path, flags, mode, uv__fs_req_cb);
+    int r = uv_fs_open(tjs_get_loop(ctx), &fr->req, path, flags, mode, cb);
+    if (is_sync) {
+        js_free(ctx, fr);
+
+        if (r > 0) {
+            a = tjs_new_file(ctx, r, path);
+            JS_FreeCString(ctx, path);
+            return a;
+        }
+        else {
+            JS_FreeCString(ctx, path);
+            return tjs_throw_errno(ctx, r);
+        }
+    }
     JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
@@ -861,8 +889,11 @@ static JSValue tjs_fs_realpath(JSContext *ctx, JSValue this_val, int argc, JSVal
     return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
 }
 
-static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
+static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, int magic) {
     const char *path = JS_ToCString(ctx, argv[0]);
+    bool is_sync = magic == 1 ? true: false;
+    uv_fs_cb cb = is_sync ? NULL: uv__fs_req_cb;
+
     if (!path)
         return JS_EXCEPTION;
 
@@ -872,14 +903,17 @@ static JSValue tjs_fs_unlink(JSContext *ctx, JSValue this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
 
-    int r = uv_fs_unlink(tjs_get_loop(ctx), &fr->req, path, uv__fs_req_cb);
+    int r = uv_fs_unlink(tjs_get_loop(ctx), &fr->req, path, cb);
     JS_FreeCString(ctx, path);
     if (r != 0) {
         js_free(ctx, fr);
         return tjs_throw_errno(ctx, r);
     }
 
-    return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    if (!is_sync)
+        return tjs_fsreq_init(ctx, fr, JS_UNDEFINED);
+    else
+        return JS_UNDEFINED;
 }
 
 static JSValue tjs_fs_rename(JSContext *ctx, JSValue this_val, int argc, JSValue *argv) {
@@ -1146,6 +1180,28 @@ static JSValue tjs_fs_readfile(JSContext *ctx, JSValue this_val, int argc, JSVal
     return TJS_InitPromise(ctx, &fr->result);
 }
 
+static JSValue tjs_fs_readfile_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *path = JS_ToCString(ctx, argv[0]);
+    JSValue arg;
+    DynBuf dbuf;
+    int r;
+    if (!path)
+        return JS_EXCEPTION;
+
+    tjs_dbuf_init(ctx, &dbuf);
+    r = tjs__load_file(ctx, &dbuf, path);
+    JS_FreeCString(ctx, path);
+    if (r != 0) {
+        dbuf_free(&dbuf);
+        return tjs_throw_errno(ctx, r);
+    }
+    arg = TJS_NewUint8Array(ctx, dbuf.buf, dbuf.size);
+    // do not free
+    //dbuf_free(&dbuf);
+    return arg;
+}
+
+
 static JSValue tjs_fs_xchown(JSContext *ctx, JSValue this_val, int argc, JSValue *argv, bool symlinks) {
     if (!JS_IsString(argv[0]))
         return JS_ThrowTypeError(ctx, "expected a string for path parameter");
@@ -1217,6 +1273,8 @@ static JSValue tjs_fs_chmod(JSContext *ctx, JSValue this_val, int argc, JSValue 
 static const JSCFunctionListEntry tjs_file_proto_funcs[] = {
     TJS_CFUNC_MAGIC_DEF("read", 2, tjs_file_rw, 0),
     TJS_CFUNC_MAGIC_DEF("write", 2, tjs_file_rw, 1),
+    TJS_CFUNC_MAGIC_DEF("readSync", 2, tjs_file_rw, 2),
+    TJS_CFUNC_MAGIC_DEF("writeSync", 2, tjs_file_rw, 3),
     TJS_CFUNC_DEF("close", 0, tjs_file_close),
     TJS_CFUNC_DEF("fileno", 0, tjs_file_fileno),
     TJS_CFUNC_DEF("stat", 0, tjs_file_stat),
@@ -1262,12 +1320,14 @@ static const JSCFunctionListEntry tjs_fs_funcs[] = {
     TJS_CONST2("COPYFILE_EXCL", UV_FS_COPYFILE_EXCL),
     TJS_CONST2("COPYFILE_FICLONE", UV_FS_COPYFILE_FICLONE),
     TJS_CONST2("COPYFILE_FICLONE_FORCE", UV_FS_COPYFILE_FICLONE_FORCE),
-    TJS_CFUNC_DEF("open", 3, tjs_fs_open),
+    TJS_CFUNC_MAGIC_DEF("open", 3, tjs_fs_open, 0),
+    TJS_CFUNC_MAGIC_DEF("openSync", 3, tjs_fs_open, 1),
     TJS_CFUNC_DEF("newStdioFile", 2, tjs_fs_new_stdio_file),
     TJS_CFUNC_MAGIC_DEF("stat", 1, tjs_fs_stat, 0),
     TJS_CFUNC_MAGIC_DEF("lstat", 1, tjs_fs_stat, 1),
     TJS_CFUNC_DEF("realpath", 1, tjs_fs_realpath),
-    TJS_CFUNC_DEF("unlink", 1, tjs_fs_unlink),
+    TJS_CFUNC_MAGIC_DEF("unlink", 1, tjs_fs_unlink, 0),
+    TJS_CFUNC_MAGIC_DEF("unlinkSync", 1, tjs_fs_unlink, 1),
     TJS_CFUNC_DEF("rename", 2, tjs_fs_rename),
     TJS_CFUNC_DEF("mkdtemp", 1, tjs_fs_mkdtemp),
     TJS_CFUNC_DEF("mkstemp", 1, tjs_fs_mkstemp),
@@ -1276,6 +1336,7 @@ static const JSCFunctionListEntry tjs_fs_funcs[] = {
     TJS_CFUNC_DEF("copyfile", 3, tjs_fs_copyfile),
     TJS_CFUNC_DEF("readdir", 1, tjs_fs_readdir),
     TJS_CFUNC_DEF("readFile", 1, tjs_fs_readfile),
+    TJS_CFUNC_DEF("readFileSync", 1, tjs_fs_readfile_sync),
     TJS_CFUNC_DEF("chown", 3, tjs_fs_chown),
     TJS_CFUNC_DEF("lchown", 3, tjs_fs_lchown),
     TJS_CFUNC_DEF("chmod", 2, tjs_fs_chmod),

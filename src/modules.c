@@ -28,7 +28,17 @@
 #include "utils.h"
 
 #include <string.h>
+#include <dlfcn.h>
 
+
+#define TJS__PATHSEP_POSIX '/'
+#if defined(_WIN32)
+#define TJS__PATHSEP     '\\'
+#define TJS__PATHSEP_STR "\\"
+#else
+#define TJS__PATHSEP     '/'
+#define TJS__PATHSEP_STR "/"
+#endif
 
 JSModuleDef *tjs__load_http(JSContext *ctx, const char *url) {
     JSModuleDef *m;
@@ -70,13 +80,77 @@ end:
 
     return m;
 }
+typedef JSModuleDef *(JSInitModuleFunc)(JSContext *ctx,
+                                        const char *module_name);
+
+
+static JSModuleDef *js_module_loader_so(JSContext *ctx,
+                                        const char *module_name)
+{
+    JSModuleDef *m;
+    void *hd;
+    JSInitModuleFunc *init;
+    char *filename;
+
+    if (!strchr(module_name, '/')) {
+        /* must add a '/' so that the DLL is not searched in the
+           system library paths */
+        filename = js_malloc(ctx, strlen(module_name) + 2 + 1);
+        if (!filename)
+            return NULL;
+        strcpy(filename, "./");
+        strcpy(filename + 2, module_name);
+    } else {
+        filename = (char *)module_name;
+    }
+
+    /* C module */
+    hd = dlopen(filename, RTLD_NOW | RTLD_GLOBAL);
+    if (filename != module_name)
+        js_free(ctx, filename);
+    if (!hd) {
+        JS_ThrowReferenceError(ctx, "could not load module filename '%s' as shared library err %s",
+                               module_name, dlerror());
+        goto fail;
+    }
+
+    init = dlsym(hd, "js_init_module");
+    if (!init) {
+        JS_ThrowReferenceError(ctx, "could not load module filename '%s': js_init_module not found",
+                               module_name);
+        goto fail;
+    }
+
+    m = init(ctx, module_name);
+    if (!m) {
+        JS_ThrowReferenceError(ctx, "could not load module filename '%s': initialization error",
+                               module_name);
+    fail:
+        if (hd)
+            dlclose(hd);
+        return NULL;
+    }
+    return m;
+}
+
+static void
+to_real_module_path(char *buf, size_t buf_size, const char *module_name) {
+
+    const char *ruff_module_path = getenv("RUFF_MODULE_PATH");
+    if (ruff_module_path)  {
+        snprintf(buf, buf_size, "%s%s%s.js", ruff_module_path, TJS__PATHSEP_STR, module_name);
+    } else {
+        snprintf(buf, buf_size, "%s%s%s.js", "modules", TJS__PATHSEP_STR, module_name);
+    }
+}
+
+static const char http[] = "http://";
+static const char https[] = "https://";
+static const char json_tpl_start[] = "export default JSON.parse(`";
+static const char json_tpl_end[] = "`);";
+static const char tjs_prefix[] = "tjs:";
 
 JSModuleDef *tjs_module_loader(JSContext *ctx, const char *module_name, void *opaque) {
-    static const char http[] = "http://";
-    static const char https[] = "https://";
-    static const char json_tpl_start[] = "export default JSON.parse(`";
-    static const char json_tpl_end[] = "`);";
-    static const char tjs_prefix[] = "tjs:";
 
     JSModuleDef *m;
     JSValue func_val;
@@ -93,51 +167,45 @@ JSModuleDef *tjs_module_loader(JSContext *ctx, const char *module_name, void *op
 
     tjs_dbuf_init(ctx, &dbuf);
 
-    is_json = has_suffix(module_name, ".json");
+    if (has_suffix(module_name, ".so")) {
+        m = js_module_loader_so(ctx, module_name);
+    } else {
+        is_json = has_suffix(module_name, ".json");
+        /* Support importing JSON files because... why not? */
+        if (is_json)
+            dbuf_put(&dbuf, (const uint8_t *) json_tpl_start, strlen(json_tpl_start));
 
-    /* Support importing JSON files because... why not? */
-    if (is_json)
-        dbuf_put(&dbuf, (const uint8_t *) json_tpl_start, strlen(json_tpl_start));
+        r = tjs__load_file(ctx, &dbuf, module_name);
+        if (r != 0) {
+            dbuf_free(&dbuf);
+            JS_ThrowReferenceError(ctx, "could not load '%s'", module_name);
+            return NULL;
+        }
 
-    r = tjs__load_file(ctx, &dbuf, module_name);
-    if (r != 0) {
+        if (is_json)
+            dbuf_put(&dbuf, (const uint8_t *) json_tpl_end, strlen(json_tpl_end));
+
+        /* Add null termination, required by JS_Eval. */
+        dbuf_putc(&dbuf, '\0');
+
+        /* compile JS the module */
+        func_val =
+            JS_Eval(ctx, (char *) dbuf.buf, dbuf.size - 1, module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
         dbuf_free(&dbuf);
-        JS_ThrowReferenceError(ctx, "could not load '%s'", module_name);
-        return NULL;
-    }
+        if (JS_IsException(func_val)) {
+            JS_FreeValue(ctx, func_val);
+            return NULL;
+        }
 
-    if (is_json)
-        dbuf_put(&dbuf, (const uint8_t *) json_tpl_end, strlen(json_tpl_end));
-
-    /* Add null termination, required by JS_Eval. */
-    dbuf_putc(&dbuf, '\0');
-
-    /* compile JS the module */
-    func_val =
-        JS_Eval(ctx, (char *) dbuf.buf, dbuf.size - 1, module_name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    dbuf_free(&dbuf);
-    if (JS_IsException(func_val)) {
+        /* XXX: could propagate the exception */
+        js_module_set_import_meta(ctx, func_val, TRUE, FALSE);
+        /* the module is already referenced, so we must free it */
+        m = JS_VALUE_GET_PTR(func_val);
         JS_FreeValue(ctx, func_val);
-        return NULL;
     }
-
-    /* XXX: could propagate the exception */
-    js_module_set_import_meta(ctx, func_val, TRUE, FALSE);
-    /* the module is already referenced, so we must free it */
-    m = JS_VALUE_GET_PTR(func_val);
-    JS_FreeValue(ctx, func_val);
 
     return m;
 }
-
-#define TJS__PATHSEP_POSIX '/'
-#if defined(_WIN32)
-#define TJS__PATHSEP     '\\'
-#define TJS__PATHSEP_STR "\\"
-#else
-#define TJS__PATHSEP     '/'
-#define TJS__PATHSEP_STR "/"
-#endif
 
 int js_module_set_import_meta(JSContext *ctx, JSValue func_val, JS_BOOL use_realpath, JS_BOOL is_main) {
     JSModuleDef *m;
@@ -204,6 +272,24 @@ int js_module_set_import_meta(JSContext *ctx, JSValue func_val, JS_BOOL use_real
     return 0;
 }
 
+static bool xdata_file_exists(const char *filename) {
+    uv_fs_t req;
+    bool is_exist = false;
+    int r;
+    r = uv_fs_access(NULL, &req, filename, 0, NULL);
+    if (r == 0 && req.result == 0) {
+        r = uv_fs_stat(NULL, &req, filename, NULL);
+        if (r == 0 && ((uv_stat_t*)req.ptr)->st_mode & S_IFREG) {
+            is_exist = true;
+        }
+    }
+    uv_fs_req_cleanup(&req);
+    if (getenv("RUFF_DEBUG") != NULL) {
+        printf("check filename %s is_exist is %d\n", filename, is_exist);
+    }
+    return is_exist;
+}
+
 static inline void tjs__normalize_pathsep(const char *name) {
 #if defined(_WIN32)
     char *p;
@@ -219,17 +305,59 @@ static inline void tjs__normalize_pathsep(const char *name) {
 }
 
 char *tjs_module_normalizer(JSContext *ctx, const char *base_name, const char *name, void *opaque) {
-#if 0
-    printf("normalize: %s %s\n", base_name, name);
-#endif
-
+    if (getenv("RUFF_DEBUG") != NULL) {
+        printf("normalize: %s %s\n", base_name, name);
+    }
+    char buf_module_name[PATH_MAX] = { 0 };
     char *filename, *p;
     const char *r;
     int len;
 
     if (name[0] != '.') {
-        /* if no initial dot, the module name is not modified */
-        return js_strdup(ctx, name);
+        int is_json, is_js;
+        is_json = has_suffix(name, ".json");
+        if (is_json) {
+            return js_strdup(ctx, name);
+        }
+        is_js = has_suffix(name, ".js");
+        if (is_js) {
+            return js_strdup(ctx, name);
+        }
+        if (strncmp(tjs_prefix, name, strlen(tjs_prefix)) == 0) {
+            return js_strdup(ctx, name);
+        }
+        if (strncmp(http, name, strlen(http)) == 0 || strncmp(https, name, strlen(https)) == 0) {
+            return js_strdup(ctx, name);
+        }
+        // check if .js exist or module/index.js exist
+        snprintf(buf_module_name, sizeof(buf_module_name), "%s.js", name);
+        if (xdata_file_exists(buf_module_name)) {
+            return js_strdup(ctx, buf_module_name);
+        }
+        snprintf(buf_module_name, sizeof(buf_module_name), "%s%sindex.js", name, TJS__PATHSEP_STR);
+        if (xdata_file_exists(buf_module_name)) {
+            return js_strdup(ctx, buf_module_name);
+        }
+        snprintf(buf_module_name, sizeof(buf_module_name), "ruff_modules%s%s.js", TJS__PATHSEP_STR, name);
+        if (xdata_file_exists(buf_module_name)) {
+            return js_strdup(ctx, buf_module_name);
+        }
+        // check if ruff_modules/name/index.js exist
+        snprintf(buf_module_name, sizeof(buf_module_name), "ruff_modules%s%s%sindex.js", TJS__PATHSEP_STR, name, TJS__PATHSEP_STR);
+        if (xdata_file_exists(buf_module_name)) {
+            return js_strdup(ctx, buf_module_name);
+        }
+
+        to_real_module_path(buf_module_name, sizeof(buf_module_name), name);
+        len = strlen(buf_module_name);
+        filename = js_malloc(ctx, len+1);
+        if (!filename)
+            return NULL;
+        memcpy(filename, buf_module_name, len);
+        filename[len] = '\0';
+        tjs__normalize_pathsep(filename);
+
+        return filename;
     }
 
     /* Normalize base_name. This is the path to the importing module, and
@@ -283,6 +411,18 @@ char *tjs_module_normalizer(JSContext *ctx, const char *base_name, const char *n
      */
     tjs__normalize_pathsep(filename);
 
+    if (xdata_file_exists(filename)) {
+        return filename;
+    }
+    snprintf(buf_module_name, sizeof(buf_module_name), "%s.js", filename);
+    if (xdata_file_exists(buf_module_name)) {
+        return js_strdup(ctx, buf_module_name);
+    }
+    snprintf(buf_module_name, sizeof(buf_module_name), "%s%sindex.js", filename, TJS__PATHSEP_STR);
+    if (xdata_file_exists(buf_module_name)) {
+        return js_strdup(ctx, buf_module_name);
+    }
+    printf("should not come to here %s\n", filename);
     return filename;
 }
 
